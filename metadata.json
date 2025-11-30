@@ -1,0 +1,7 @@
+{
+  "name": "Vercel用面談AI要約アシスタント",
+  "description": "就労移行支援事業所向け：面談のリアルタイム文字起こしと構造化要約生成支援アプリ。",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
