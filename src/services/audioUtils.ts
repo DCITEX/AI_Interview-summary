@@ -1,10 +1,14 @@
-import { Blob } from '@google/genai';
+// Return type compatible with Gemini API expectations without importing the SDK directly
+export interface AudioBlob {
+  data: string;
+  mimeType: string;
+}
 
 /**
  * Converts Float32Array PCM audio data to the format expected by Gemini Live API.
  * 16-bit PCM, 16kHz is standard for this API usage in the guide.
  */
-export function createPcmBlob(data: Float32Array): Blob {
+export function createPcmBlob(data: Float32Array): AudioBlob {
   const l = data.length;
   const int16 = new Int16Array(l);
   for (let i = 0; i < l; i++) {

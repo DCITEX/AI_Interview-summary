@@ -1,11 +1,11 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { GoogleGenAI, LiveServerMessage, Modality, Type } from '@google/genai';
-import { TranscriptItem, RagDocument, AppStatus, SpeakerRole } from './types';
+import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
+import { TranscriptItem, RagDocument, AppStatus } from './types';
 import { TEMPLATES, MODEL_NAMES } from './constants';
 import { createPcmBlob, arrayBufferToBase64 } from './services/audioUtils';
 import TranscriptView from './components/TranscriptView';
 import SummaryPanel from './components/SummaryPanel';
-import { Mic, AlertCircle, PlayCircle, StopCircle, Menu, X, Wand2, Loader2, RotateCcw } from 'lucide-react';
+import { Mic, AlertCircle, PlayCircle, StopCircle, Menu, X, RotateCcw, Loader2 } from 'lucide-react';
 
 const App: React.FC = () => {
   // --- State ---
@@ -15,6 +15,7 @@ const App: React.FC = () => {
   const [documents, setDocuments] = useState<RagDocument[]>([]);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
   const [sessionId, setSessionId] = useState<string>(Date.now().toString()); // Used to force reset child components
   const [hasPostProcessed, setHasPostProcessed] = useState(false); // Tracks if AI diarization has been done
@@ -28,387 +29,311 @@ const App: React.FC = () => {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   
-  // Buffers for Transcript accumulation
-  const activeTranscriptIdRef = useRef<string | null>(null);
-  const lastUpdateTimeRef = useRef<number>(0);
+  // --- API Key Initialization ---
+  // Safely retrieve API key handling different environments
+  const getApiKey = () => {
+    try {
+      // Check Vite env
+      // @ts-ignore
+      if (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_API_KEY) {
+        // @ts-ignore
+        return import.meta.env.VITE_API_KEY;
+      }
+    } catch (e) {}
+    
+    try {
+      // Check Node env (fallback)
+      // @ts-ignore
+      if (typeof process !== 'undefined' && process.env && process.env.API_KEY) {
+        // @ts-ignore
+        return process.env.API_KEY;
+      }
+    } catch (e) {}
+    
+    return undefined;
+  };
+  
+  const apiKey = getApiKey();
+  
+  // --- Helpers ---
+  const updateTranscript = (id: string, text: string, isFinal: boolean) => {
+    setTranscripts(prev => {
+      const existing = prev.find(t => t.id === id);
+      if (existing) {
+        return prev.map(t => t.id === id ? { ...t, text, isFinal } : t);
+      } else {
+        return [...prev, {
+          id,
+          speaker: 'Staff', // Default to Staff during live recording
+          text,
+          timestamp: new Date(),
+          isFinal
+        }];
+      }
+    });
+  };
 
-  // --- Effects ---
-
-  // Clean up on unmount
-  useEffect(() => {
-    return () => {
-      stopRecording();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // --- Logic: Recording (Gemini Live + MediaRecorder) ---
+  // --- Actions ---
 
   const startRecording = async () => {
-    if (!process.env.API_KEY) {
-      setErrorMsg("API Key not found.");
+    if (!apiKey) {
+      setErrorMsg("APIキーが設定されていません。.envファイルを確認してください。");
       return;
     }
 
-    setStatus(AppStatus.CONNECTING);
     setErrorMsg(null);
-    setRecordedBlob(null); // Clear previous recording
-    activeTranscriptIdRef.current = null; // Reset current bubble
-    audioChunksRef.current = []; // Clear chunks
-
+    setTranscripts([]);
+    setSummary('');
+    audioChunksRef.current = [];
+    
     try {
-      // 1. Audio Setup - Robust Error Handling
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        throw new Error("お使いのブラウザはマイク録音をサポートしていません。");
-      }
+      setStatus(AppStatus.CONNECTING);
 
-      let stream: MediaStream;
+      // 1. Setup Audio Stream
+      let stream;
       try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream = await navigator.mediaDevices.getUserMedia({ 
+            audio: {
+                sampleRate: 16000,
+                channelCount: 1,
+                echoCancellation: true,
+                noiseSuppression: true
+            } 
+        });
       } catch (err: any) {
-        console.error("Microphone Access Error:", err);
-        let message = "マイクへのアクセスに失敗しました。";
-        
-        if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError' || err.message?.includes('device not found')) {
-            message = "マイクが見つかりません。デバイスが接続されているか確認してください。";
+        if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+            throw new Error("マイクが見つかりません。マイクが接続されているか確認してください。");
         } else if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-            message = "マイクの使用が許可されていません。ブラウザのアドレスバーから許可設定を行ってください。";
+            throw new Error("マイクの使用が許可されていません。ブラウザの設定でマイクへのアクセスを許可してください。");
         } else if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
-            message = "マイクにアクセスできません。他のアプリケーション（ZoomやTeamsなど）がマイクを使用していないか確認してください。";
+            throw new Error("マイクにアクセスできません。他のアプリケーション（Zoomなど）がマイクを使用していないか確認してください。");
+        } else {
+            throw new Error("マイクの初期化に失敗しました: " + err.message);
         }
-        
-        throw new Error(message);
       }
-
-      streamRef.current = stream;
       
-      const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
-      const audioContext = new AudioContext({ sampleRate: 16000 });
-      // Resume audio context if it's suspended (browser autoplay policy)
-      if (audioContext.state === 'suspended') {
-        await audioContext.resume();
-      }
+      streamRef.current = stream;
+
+      // 2. Setup MediaRecorder for background recording (Full Quality for Post-Processing)
+      // Use a lower bitrate to prevent massive file sizes on long recordings
+      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') 
+        ? 'audio/webm;codecs=opus' 
+        : 'audio/webm';
+        
+      const mediaRecorder = new MediaRecorder(stream, { 
+        mimeType,
+        audioBitsPerSecond: 64000 // 64kbps is sufficient for voice
+      });
+      
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunksRef.current.push(e.data);
+      };
+      mediaRecorder.start(1000); // Time slice 1s to ensure data is saved incrementally
+      mediaRecorderRef.current = mediaRecorder;
+
+      // 3. Setup AudioContext for Realtime API
+      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      // Ensure context is running (fixes some browser autoplay policies)
+      await audioContext.resume();
       audioContextRef.current = audioContext;
 
-      // --- Parallel Recording Setup (for Post-Processing) ---
-      // 32kbps ensures ~1 hour fits in ~15-20MB, which is safe for Gemini inline data limit.
-      const mimeType = 'audio/webm;codecs=opus';
-      const options = MediaRecorder.isTypeSupported(mimeType) 
-        ? { mimeType, bitsPerSecond: 32000 } 
-        : { bitsPerSecond: 32000 };
+      const source = audioContext.createMediaStreamSource(stream);
+      const processor = audioContext.createScriptProcessor(4096, 1, 1);
       
-      const mediaRecorder = new MediaRecorder(stream, options);
-      mediaRecorderRef.current = mediaRecorder;
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
-        }
-      };
-      // Start with 1000ms timeslice to ensure we get data incrementally.
-      mediaRecorder.start(1000);
-      // -----------------------------------------------------
-
-      // 2. Connect to Live API
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-      const sessionPromise = ai.live.connect({
+      // 4. Connect to Gemini Live API
+      const ai = new GoogleGenAI({ apiKey });
+      const session = await ai.live.connect({
         model: MODEL_NAMES.LIVE,
-        callbacks: {
-            onopen: () => {
-              console.log("Gemini Live Connected");
-              setStatus(AppStatus.RECORDING);
-
-              const source = audioContext.createMediaStreamSource(stream);
-              const processor = audioContext.createScriptProcessor(4096, 1, 1);
-              scriptProcessorRef.current = processor;
-
-              processor.onaudioprocess = (e) => {
-                 const inputData = e.inputBuffer.getChannelData(0);
-                 const pcmBlob = createPcmBlob(inputData);
-                 sessionPromise.then(session => {
-                     return session.sendRealtimeInput({ media: pcmBlob });
-                 }).catch(e => {
-                     console.debug("Audio send skipped:", e);
-                 });
-              };
-
-              source.connect(processor);
-              processor.connect(audioContext.destination);
-            },
-            onmessage: (msg: LiveServerMessage) => {
-               // Handle transcription
-               if (msg.serverContent?.inputTranscription) {
-                  const text = msg.serverContent.inputTranscription.text;
-                  if (text) {
-                     handleTranscriptChunk(text);
-                  }
-               }
-            },
-            onclose: () => {
-                console.log("Gemini Live Closed");
-                // Only consider it an error if we didn't intend to stop
-                // But since we can't easily distinguish remote close vs local close here without state,
-                // we rely on the stopRecording logic to handle cleanup.
-                // If closed unexpectedly, user will see recording stop.
-                if (status === AppStatus.RECORDING) {
-                    // Try to save whatever we have
-                    stopRecording().then(() => {
-                        setErrorMsg("サーバーとの接続が切断されました（録音データは保存されました）。");
-                    });
-                }
-            },
-            onerror: (err) => {
-                console.error("Gemini Live Error", err);
-                if (status === AppStatus.CONNECTING) {
-                    setErrorMsg("接続エラーが発生しました。ネットワーク状況を確認して再接続してください。");
-                    setStatus(AppStatus.ERROR);
-                } 
-                // Don't auto-stop on minor errors, wait for onclose or user action unless critical
-            }
-        },
         config: {
-            responseModalities: [Modality.AUDIO], 
-            inputAudioTranscription: {}, 
-            systemInstruction: `
-            あなたは就労移行支援事業所の面談記録を行う、非常に厳格な書記です。
-            以下のルールを絶対厳守して、ユーザーの音声を正確な日本語で書き起こしてください。
-
-            【最重要ルール】
-            1. **完全な聞き取りのみ**: 音声としてはっきり聞こえた言葉だけを書き取ってください。
-            2. **捏造・補完の禁止**: 音声に含まれていない情報は、絶対に追記しないでください。
-            3. **推測の禁止**: 文脈や支援員の言葉から推測して、利用者の発言を勝手に作らないでください。
-            4. **役割**: あなたは会話アシスタントではありません。返答は不要です。
-
-            【整形ルール】
-            - "あー"、"えーっと" などのフィラーは削除。
-            - 文脈に合わせて句読点を付与。
-            `,
-            speechConfig: {
-                voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
+          responseModalities: [Modality.AUDIO],
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } },
+          systemInstruction: `
+あなたは面談の書記です。ユーザーの発言を聞き取り、正確な日本語の書き起こしテキストを生成してください。
+返答や会話は一切しないでください。あなたの役割は「inputTranscription」イベントを発生させることだけです。
+音声認識が誤りやすい、以下の点に注意してください：
+- "あー"、"えー" などのフィラーは削除して、整った文章にしてください。
+- 文脈に合わせて適切な句読点を補ってください。
+- 音声に含まれていない情報は絶対に追記しないこと（ハルシネーション対策）。
+          `,
+          inputAudioTranscription: { model: "google-speech-to-text-japanese" },
+        },
+        callbacks: {
+          onopen: () => {
+            console.log("Gemini Live Connected");
+            setStatus(AppStatus.RECORDING);
+          },
+          onmessage: (msg: LiveServerMessage) => {
+            // We only care about transcriptions
+            const text = msg.serverContent?.inputTranscription?.text;
+            if (text) {
+              // Optionally handle live transcriptions if needed
             }
+          },
+          onclose: () => {
+             console.log("Gemini Live Disconnected");
+          },
+          onerror: (err) => {
+            console.error("Gemini Live Error:", err);
+            if (status === AppStatus.RECORDING) {
+                // If we get an error while recording, try to save what we have
+                stopRecording(true); 
+                setErrorMsg("サーバー接続が切れました（データは保存されました）");
+            }
+          }
         }
       });
 
-      sessionRef.current = await sessionPromise;
+      sessionRef.current = session;
+
+      // 5. Start Streaming Audio
+      processor.onaudioprocess = (e) => {
+        const inputData = e.inputBuffer.getChannelData(0);
+        const pcmBlob = createPcmBlob(inputData);
+        session.sendRealtimeInput({ media: pcmBlob });
+      };
+
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+      scriptProcessorRef.current = processor;
 
     } catch (e: any) {
       console.error(e);
-      // Clean up if setup failed
-      if (streamRef.current) {
-          streamRef.current.getTracks().forEach(track => track.stop());
-          streamRef.current = null;
-      }
-      setErrorMsg(`${e.message}`);
-      setStatus(AppStatus.ERROR);
+      setErrorMsg(e.message || "録音の開始に失敗しました");
+      setStatus(AppStatus.IDLE);
+      // Clean up if partially started
+      if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
     }
   };
 
-  const stopRecording = async () => {
-    // 1. Stop Live API components
-    if (scriptProcessorRef.current) {
-        scriptProcessorRef.current.disconnect();
-        scriptProcessorRef.current = null;
+  const stopRecording = async (isError = false) => {
+    if (status !== AppStatus.RECORDING && status !== AppStatus.CONNECTING) return;
+
+    // 1. Stop Gemini Session
+    if (sessionRef.current) {
+      sessionRef.current = null;
     }
-    if (streamRef.current) {
-        streamRef.current.getTracks().forEach(track => track.stop());
-        streamRef.current = null;
+
+    // 2. Stop Audio Processing
+    if (scriptProcessorRef.current) {
+      scriptProcessorRef.current.disconnect();
+      scriptProcessorRef.current = null;
     }
     if (audioContextRef.current) {
-        audioContextRef.current.close();
-        audioContextRef.current = null;
+      audioContextRef.current.close();
+      audioContextRef.current = null;
     }
-    if (sessionRef.current) {
-        try {
-            // @ts-ignore
-            sessionRef.current.close();
-        } catch(e) {}
-        sessionRef.current = null;
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
     }
 
-    // 2. Stop MediaRecorder
+    // 3. Stop Media Recorder and Save Blob
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-        mediaRecorderRef.current.requestData();
-        await new Promise<void>(resolve => {
-            const timeout = setTimeout(() => resolve(), 1000);
-            if (!mediaRecorderRef.current) { clearTimeout(timeout); return resolve(); }
-            mediaRecorderRef.current.onstop = () => {
-                clearTimeout(timeout);
-                resolve();
-            };
-            mediaRecorderRef.current.stop();
-        });
-    }
+      mediaRecorderRef.current.requestData(); 
+      
+      const blobPromise = new Promise<Blob>((resolve) => {
+        if (!mediaRecorderRef.current) {
+             resolve(new Blob([], { type: 'audio/webm' }));
+             return;
+        }
+        
+        mediaRecorderRef.current.onstop = () => {
+            const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+            resolve(blob);
+        };
+        mediaRecorderRef.current.stop();
+      });
 
-    if (audioChunksRef.current.length > 0) {
-        const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-        setRecordedBlob(blob);
-        // Automatically trigger analysis
+      // Wait for blob then proceed
+      const blob = await blobPromise;
+      setRecordedBlob(blob);
+      setIsSessionFinished(true);
+
+      if (!isError) {
+        // Automatically start analysis
         analyzeAudioAndDiarize(blob);
-    }
-
-    activeTranscriptIdRef.current = null;
-    setStatus(AppStatus.IDLE);
-    setIsSessionFinished(true);
-  };
-
-  // --- Logic: Reset Session ---
-  const resetSession = async () => {
-    if (status === AppStatus.RECORDING) {
-         if (!window.confirm("録音を停止して、データをリセットしますか？\n(現在の録音は保存されません)")) return;
-    } else if (transcripts.length > 0 || summary || documents.length > 0 || recordedBlob) {
-         if (!window.confirm("現在の面談データをすべて消去して、新しい面談を開始しますか？\n(未保存のデータは失われます)")) return;
-    }
-    
-    // Cleanup synchronous
-    if (scriptProcessorRef.current) {
-        scriptProcessorRef.current.disconnect();
-        scriptProcessorRef.current = null;
-    }
-    if (streamRef.current) {
-        streamRef.current.getTracks().forEach(track => track.stop());
-        streamRef.current = null;
-    }
-    if (audioContextRef.current) {
-        audioContextRef.current.close();
-        audioContextRef.current = null;
-    }
-    if (sessionRef.current) {
-        try {
-            // @ts-ignore
-            sessionRef.current.close();
-        } catch(e) {}
-        sessionRef.current = null;
-    }
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-        try { mediaRecorderRef.current.stop(); } catch(e) {}
-    }
-    
-    // Reset State
-    setStatus(AppStatus.IDLE);
-    setTranscripts([]);
-    setSummary('');
-    setDocuments([]);
-    setRecordedBlob(null);
-    setErrorMsg(null);
-    setHasPostProcessed(false);
-    setIsSessionFinished(false);
-    
-    activeTranscriptIdRef.current = null;
-    audioChunksRef.current = [];
-    
-    // CRITICAL: Update sessionId to force unmount/remount of children components
-    // This ensures internal state of SummaryPanel/TranscriptView is wiped.
-    setSessionId(Date.now().toString());
-  };
-
-  // --- Logic: Transcript Management ---
-
-  const handleTranscriptChunk = (text: string) => {
-    if (!text.trim()) return;
-
-    setTranscripts(prev => {
-        const now = Date.now();
-        return processTranscriptUpdate(prev, text, now, 'Staff');
-    });
-  };
-  
-  const processTranscriptUpdate = (
-      currentTranscripts: TranscriptItem[], 
-      text: string, 
-      now: number,
-      speaker: SpeakerRole
-  ) => {
-      const newTranscripts = [...currentTranscripts];
-      const lastId = activeTranscriptIdRef.current;
-      const lastItemIndex = newTranscripts.findIndex(t => t.id === lastId);
-      const lastItem = lastItemIndex !== -1 ? newTranscripts[lastItemIndex] : null;
-
-      const TIME_THRESHOLD_MS = 3000; 
-      const isRecent = (now - lastUpdateTimeRef.current) < TIME_THRESHOLD_MS;
-
-      if (lastItem && lastItem.speaker === speaker && isRecent) {
-          newTranscripts[lastItemIndex] = {
-              ...lastItem,
-              text: lastItem.text + text,
-              isFinal: false 
-          };
-          lastUpdateTimeRef.current = now;
       } else {
-          const newId = now.toString();
-          activeTranscriptIdRef.current = newId;
-          lastUpdateTimeRef.current = now;
-          
-          newTranscripts.push({
-              id: newId,
-              speaker: speaker,
-              text: text,
-              timestamp: new Date(),
-              isFinal: true
-          });
+        setStatus(AppStatus.IDLE);
       }
-      return newTranscripts;
+    } else {
+        setStatus(AppStatus.IDLE);
+        setIsSessionFinished(true);
+    }
   };
 
-  const updateTranscript = (id: string, newText: string) => {
-    setTranscripts(prev => prev.map(t => t.id === id ? { ...t, text: newText } : t));
-  };
-
-  // --- Logic: Post-Processing ---
-
-  const analyzeAudioAndDiarize = async (blobToAnalyze?: Blob) => {
-    const targetBlob = blobToAnalyze || recordedBlob;
-    if (!targetBlob || !process.env.API_KEY) return;
-    
+  const analyzeAudioAndDiarize = async (audioBlob: Blob) => {
+    if (!apiKey) return;
     setStatus(AppStatus.PROCESSING);
     setErrorMsg(null);
 
     try {
-        const arrayBuffer = await targetBlob.arrayBuffer();
-        const base64Audio = arrayBufferToBase64(arrayBuffer);
+        const ai = new GoogleGenAI({ apiKey });
+        
+        // Convert Blob to Base64
+        const buffer = await audioBlob.arrayBuffer();
+        const base64Audio = arrayBufferToBase64(buffer);
 
-        // Check if data is too large (approx 19MB to be safe for 20MB limit)
-        if (base64Audio.length > 19 * 1024 * 1024) {
-             throw new Error("録音データが大きすぎます（約60分以上）。CSVエクスポートで保存してください。");
-        }
-
-        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+        // Prompt for Diarization
         const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
+            model: MODEL_NAMES.SUMMARY,
             contents: {
                 parts: [
-                    { inlineData: { mimeType: targetBlob.type || 'audio/webm', data: base64Audio } },
-                    { text: `
-                    この音声は就労移行支援事業所での面談記録です。以下の手順で処理してください。
-                    
-                    1. 音声全体を正確に書き起こしてください。
-                    2. 話者分離を行ってください。主な話者は「支援員(Staff)」と「利用者(Client)」です。
-                    3. 音声に含まれていない情報の捏造は絶対にしないでください。
-                    4. 結果をJSON配列で出力してください。
-                    ` }
+                    {
+                        inlineData: {
+                            mimeType: "audio/webm",
+                            data: base64Audio
+                        }
+                    },
+                    {
+                        text: `
+この音声は、就労移行支援事業所での「支援員(Staff)」と「利用者(Client)」の面談記録です。
+以下の手順で処理を行ってください：
+
+1. 話者を「Staff」と「Client」に分離してください。
+   - 敬語を使っている、質問している、指導している方が「Staff」です。
+   - 自身の体調や状況を話している方が「Client」です。
+2. 音声認識の誤りを修正し、自然な日本語の書き起こしを作成してください。
+   - "あー"、"えー" などのフィラーは削除。
+   - 文脈に沿って句読点を付与。
+   - 音声に含まれていない情報は絶対に追記しないこと（ハルシネーション対策）。
+3. 結果を以下のJSON形式で出力してください。
+   [
+     { "speaker": "Staff", "text": "...", "timestamp": "00:00" },
+     { "speaker": "Client", "text": "...", "timestamp": "00:05" }
+   ]
+`
+                    }
                 ]
             },
             config: {
-                responseMimeType: "application/json",
-                responseSchema: {
-                    type: Type.ARRAY,
-                    items: {
-                        type: Type.OBJECT,
-                        properties: {
-                            speaker: { type: Type.STRING, enum: ['Staff', 'Client'] },
-                            text: { type: Type.STRING }
-                        },
-                        required: ['speaker', 'text']
-                    }
-                }
+                responseMimeType: "application/json"
             }
         });
 
-        const jsonText = response.text;
-        if (!jsonText) throw new Error("Empty response");
-        const parsed = JSON.parse(jsonText);
+        let jsonText = response.text || "";
         
-        const newTranscripts: TranscriptItem[] = parsed.map((item: any, index: number) => ({
-            id: `post-process-${index}`,
-            speaker: item.speaker as SpeakerRole,
+        // Robust JSON cleaning
+        // 1. Try to find the first array brackets
+        const match = jsonText.match(/\[[\s\S]*\]/);
+        if (match) {
+            jsonText = match[0];
+        } else {
+            // Fallback: cleanup common markdown
+            jsonText = jsonText.replace(/```json\s*/g, '').replace(/```/g, '').trim();
+        }
+
+        let result;
+        try {
+            result = JSON.parse(jsonText);
+        } catch (e) {
+            console.error("JSON parse error:", jsonText);
+            throw new Error("AIの応答をJSONとして解析できませんでした。");
+        }
+
+        // Convert to internal TranscriptItem format
+        const newTranscripts: TranscriptItem[] = result.map((item: any, index: number) => ({
+            id: `auto-${index}`,
+            speaker: (item.speaker === 'Staff' || item.speaker === 'Client') ? item.speaker : 'Staff',
             text: item.text,
             timestamp: new Date(),
             isFinal: true
@@ -416,204 +341,284 @@ const App: React.FC = () => {
 
         setTranscripts(newTranscripts);
         setHasPostProcessed(true);
+        setStatus(AppStatus.IDLE);
 
     } catch (e: any) {
-        console.error("Diarization error:", e);
-        setErrorMsg(`分析処理に失敗しました: ${e.message}`);
-    } finally {
+        console.error(e);
+        setErrorMsg("AI分析中にエラーが発生しました: " + e.message);
         setStatus(AppStatus.IDLE);
     }
   };
 
-  // --- Logic: RAG & Summary ---
-  
-  const handleFileUpload = async (files: FileList) => {
-    const newDocs: RagDocument[] = [];
-    for (let i = 0; i < files.length; i++) {
-        const file = files[i];
-        
-        if (file.type.startsWith('image/') || file.type === 'application/pdf') {
-             // Binary handling for Images/PDF
-             const reader = new FileReader();
-             reader.onload = (e) => {
-                 const result = e.target?.result as string;
-                 const base64 = result.split(',')[1];
-                 setDocuments(prev => [...prev, {
-                     id: Date.now() + '-' + i,
-                     name: file.name,
-                     content: base64, // Store base64
-                     type: file.type === 'application/pdf' ? 'application/pdf' : 'image/jpeg' // simplify mime
-                 } as any]);
-             };
-             reader.readAsDataURL(file);
-        } else {
-             // Text handling
-             const text = await file.text();
-             newDocs.push({
-                id: Date.now() + '-' + i,
-                name: file.name,
-                content: text,
-                type: 'text/plain'
+  const generateSummary = async (templateId: string, customInstruction: string) => {
+    if (!apiKey) return;
+    if (transcripts.length === 0 && documents.length === 0) {
+      alert("要約する内容（会話ログまたは資料）がありません。");
+      return;
+    }
+    
+    setStatus(AppStatus.PROCESSING);
+    
+    try {
+      const template = TEMPLATES.find(t => t.id === templateId);
+      const promptText = template ? template.prompt : '';
+      
+      // Construct conversation log
+      const conversationLog = transcripts
+        .map(t => `[${t.speaker}]: ${t.text}`)
+        .join('\n');
+
+      const ai = new GoogleGenAI({ apiKey });
+
+      // Construct parts: Text Prompt + Images/PDFs
+      const parts: any[] = [];
+
+      // 1. Text Prompt (Conversation + Instructions)
+      let fullPrompt = `
+【指示】
+${promptText}
+
+【追加指示】
+${customInstruction}
+
+【会話ログ】
+${conversationLog.length > 0 ? conversationLog : "(会話ログなし)"}
+`;
+      // If there are text documents, append them to the prompt text
+      const textDocs = documents.filter(d => d.type === 'text/plain' || d.type === 'application/json');
+      if (textDocs.length > 0) {
+        fullPrompt += `\n\n【参照資料テキスト】\n`;
+        textDocs.forEach(d => {
+            fullPrompt += `--- ${d.name} ---\n${d.content}\n\n`;
+        });
+      }
+
+      // Add the main text part
+      parts.push({ text: fullPrompt });
+
+      // 2. Binary Documents (Images/PDFs)
+      documents.forEach(doc => {
+        if (doc.type !== 'text/plain' && doc.type !== 'application/json') {
+            // content is base64 string
+            parts.push({
+                inlineData: {
+                    mimeType: doc.type,
+                    data: doc.content
+                }
             });
         }
+      });
+
+      const response = await ai.models.generateContent({
+        model: MODEL_NAMES.SUMMARY,
+        contents: { parts: parts },
+        config: {
+            systemInstruction: "あなたは就労移行支援事業所の熟練した支援員です。客観的かつ専門的な視点で記録を作成してください。音声や資料に含まれていない情報は絶対に捏造しないでください。",
+        }
+      });
+
+      setSummary(response.text || '');
+    } catch (e: any) {
+      console.error(e);
+      setErrorMsg("要約の生成に失敗しました: " + e.message);
+    } finally {
+      setStatus(AppStatus.IDLE);
     }
-    if (newDocs.length > 0) {
-        setDocuments(prev => [...prev, ...newDocs]);
+  };
+
+  const handleFileUpload = async (files: FileList) => {
+    const newDocs: RagDocument[] = [];
+    
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      
+      try {
+        let content = '';
+        let docType: string = 'text/plain';
+
+        if (file.type === 'application/pdf') {
+            docType = 'application/pdf';
+            content = await fileToBase64(file);
+        } else if (file.type.startsWith('image/')) {
+            if (file.type === 'image/png') docType = 'image/png';
+            else if (file.type === 'image/webp') docType = 'image/webp';
+            else docType = 'image/jpeg';
+            content = await fileToBase64(file);
+        } else {
+            docType = 'text/plain';
+            content = await file.text();
+        }
+
+        newDocs.push({
+          id: Math.random().toString(36).substr(2, 9),
+          name: file.name,
+          content: content,
+          type: docType as RagDocument['type'] // Explicit cast to allow broader types
+        });
+      } catch (e) {
+        console.error("File read error", e);
+      }
     }
+    
+    setDocuments(prev => [...prev, ...newDocs]);
+  };
+
+  const fileToBase64 = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+            const result = reader.result as string;
+            // Remove Data URL prefix (e.g. "data:image/png;base64,")
+            const base64 = result.split(',')[1];
+            resolve(base64);
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+    });
   };
 
   const removeDocument = (id: string) => {
     setDocuments(prev => prev.filter(d => d.id !== id));
   };
 
-  const generateSummary = async (templateId: string, customInstruction: string) => {
-    if (!process.env.API_KEY) return;
-    setStatus(AppStatus.PROCESSING);
-    
-    try {
-        const template = TEMPLATES.find(t => t.id === templateId);
-        
-        // 1. Prepare Text Context from Transcripts
-        const transcriptText = `【面談記録】\n${transcripts.map(t => `[${t.timestamp.toLocaleTimeString()}] ${t.speaker === 'Staff' ? '支援員' : '利用者'}: ${t.text}`).join('\n')}`;
-        
-        // 2. Prepare Prompt Text
-        const promptText = `${template?.prompt}\n${customInstruction ? `追加指示: ${customInstruction}` : ''}\n\n対象データ:\n${transcriptText}`;
-
-        // 3. Build Parts for Multimodal Request
-        const parts: any[] = [{ text: promptText }];
-
-        // 4. Add RAG Documents
-        if (documents.length > 0) {
-            parts.push({ text: "\n\n【参照資料】\n以下の資料も考慮して要約を作成してください。" });
-            
-            documents.forEach(doc => {
-                if (doc.type === 'text/plain') {
-                    parts.push({ text: `\n--- ${doc.name} ---\n${doc.content}\n----------------\n` });
-                } else {
-                    // Binary (PDF/Image)
-                    parts.push({ 
-                        inlineData: { 
-                            mimeType: doc.type, 
-                            data: doc.content 
-                        } 
-                    });
-                    parts.push({ text: `(上記は資料: ${doc.name})` });
-                }
-            });
-        }
-
-        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-        const response = await ai.models.generateContent({
-            model: MODEL_NAMES.SUMMARY,
-            contents: { parts }
-        });
-
-        setSummary(response.text || "要約生成失敗");
-    } catch (e: any) {
-        setErrorMsg(`要約生成エラー: ${e.message}`);
-    } finally {
-        setStatus(AppStatus.IDLE);
+  const resetSession = () => {
+    if (!window.confirm("現在の記録をすべて削除して、初期状態に戻しますか？\n（保存していないデータは失われます）")) {
+        return;
     }
+    // Stop any ongoing processes
+    if (status === AppStatus.RECORDING) {
+        if (sessionRef.current) sessionRef.current = null;
+        if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
+    }
+
+    // Reset All States
+    setTranscripts([]);
+    setSummary('');
+    setDocuments([]);
+    setRecordedBlob(null);
+    setHasPostProcessed(false);
+    setIsSessionFinished(false);
+    setErrorMsg(null);
+    setStatus(AppStatus.IDLE);
+    setSessionId(Date.now().toString()); // Force remount children
   };
 
   // --- Render ---
-
   return (
-    <div className="flex flex-col h-screen bg-slate-50 text-slate-800 font-sans">
+    <div className="flex flex-col h-screen bg-slate-50 text-slate-900">
       
       {/* Header */}
-      <header className="h-16 bg-white border-b border-slate-200 flex items-center justify-between px-4 md:px-6 shadow-sm z-20">
-         <div className="flex items-center gap-2 md:gap-3 flex-shrink-0">
-             <div className="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center text-white">
-                 <Mic size={20} />
-             </div>
-             <h1 className="font-bold text-sm md:text-lg text-slate-800 tracking-tight whitespace-nowrap">面談AI要約</h1>
-         </div>
-         
-         <div className="flex items-center gap-2 md:gap-4 flex-shrink-0">
+      <header className="flex-shrink-0 bg-white border-b border-slate-200 px-4 py-3 flex items-center justify-between shadow-sm z-10 h-16">
+        <div className="flex items-center gap-3">
+            <div className="bg-indigo-600 text-white p-2 rounded-lg">
+                <Mic size={20} />
+            </div>
+            <h1 className="text-lg md:text-xl font-bold text-slate-800 tracking-tight">
+                面談AI要約 <span className="hidden sm:inline text-slate-400 font-normal">| Assistant</span>
+            </h1>
+        </div>
+        
+        <div className="flex items-center gap-3">
+             {/* Reset Button */}
              <button 
                 onClick={resetSession}
-                className="flex items-center gap-1.5 px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-lg transition-colors text-sm font-medium"
-                title="初期化"
+                className="flex items-center gap-2 text-slate-500 hover:text-red-600 hover:bg-red-50 px-3 py-2 rounded-lg transition-colors"
+                title="リセット"
              >
                 <RotateCcw size={18} />
-                <span className="hidden md:inline">リセット</span>
+                <span className="hidden md:inline text-sm font-medium">リセット</span>
              </button>
 
-            <span className={`hidden sm:flex px-3 py-1 rounded-full text-xs font-medium items-center gap-1.5 ${
-                status === AppStatus.RECORDING 
-                    ? 'bg-red-50 text-red-600 border border-red-100 animate-pulse'
-                    : 'bg-slate-100 text-slate-500'
-            }`}>
-                <div className={`w-2 h-2 rounded-full ${status === AppStatus.RECORDING ? 'bg-red-500' : 'bg-slate-400'}`} />
-                {status === AppStatus.RECORDING ? '録音中' : '待機中'}
-            </span>
-            {/* Simple status dot for mobile */}
-            <div className={`sm:hidden w-3 h-3 rounded-full ${status === AppStatus.RECORDING ? 'bg-red-500 animate-pulse' : 'bg-slate-300'}`} />
+             {/* Status Badge */}
+             <div className={`hidden md:flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-bold border ${
+                status === AppStatus.RECORDING ? 'bg-red-50 text-red-600 border-red-100 animate-pulse' : 
+                status === AppStatus.PROCESSING ? 'bg-amber-50 text-amber-600 border-amber-100' :
+                'bg-slate-100 text-slate-500 border-slate-200'
+             }`}>
+                <div className={`w-2 h-2 rounded-full ${
+                    status === AppStatus.RECORDING ? 'bg-red-500' : 
+                    status === AppStatus.PROCESSING ? 'bg-amber-500' :
+                    'bg-slate-400'
+                }`} />
+                {status === AppStatus.IDLE && '待機中'}
+                {status === AppStatus.CONNECTING && '接続中...'}
+                {status === AppStatus.RECORDING && '記録中'}
+                {status === AppStatus.PROCESSING && 'AI分析中...'}
+             </div>
 
-            <button 
+             {/* Mobile Menu Toggle */}
+             <button 
                 className="md:hidden p-2 text-slate-600 hover:bg-slate-100 rounded-lg"
-                onClick={() => setIsMobileMenuOpen(true)}
-            >
-                <Menu size={24} />
-            </button>
-         </div>
+                onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
+             >
+                {isMobileMenuOpen ? <X size={24} /> : <Menu size={24} />}
+             </button>
+        </div>
       </header>
 
-      {/* Main Layout */}
-      <main className="flex-1 flex overflow-hidden relative">
-        <div className="flex-1 flex flex-col relative overflow-hidden">
-             {errorMsg && (
-                 <div className="m-4 p-3 bg-red-50 border border-red-200 text-red-700 text-sm rounded-lg flex items-center gap-2 animate-fade-in">
-                     <AlertCircle size={16} /> {errorMsg}
-                     <button onClick={() => setErrorMsg(null)} className="ml-auto"><X size={14}/></button>
-                 </div>
-             )}
-             
-             {status === AppStatus.PROCESSING && !summary && (
-                  <div className="absolute inset-0 bg-white/50 z-20 flex items-center justify-center backdrop-blur-sm">
-                      <div className="bg-white p-6 rounded-2xl shadow-xl flex flex-col items-center gap-3">
-                          <Loader2 className="animate-spin text-indigo-600" size={32} />
-                          <p className="font-bold text-slate-700">AIが音声を分析中...</p>
-                      </div>
-                  </div>
-             )}
-             
-             <div className="flex-1 overflow-y-auto bg-slate-50/50">
-                 <TranscriptView 
-                    key={sessionId} // Force remount on reset
-                    transcripts={transcripts}
-                    onEdit={updateTranscript}
-                    isRecording={status === AppStatus.RECORDING}
-                 />
-             </div>
+      {/* Error Banner */}
+      {errorMsg && (
+        <div className="bg-red-50 border-b border-red-200 px-4 py-2 flex items-center justify-between animate-slide-down">
+            <div className="flex items-center gap-2 text-sm text-red-700 font-medium">
+                <AlertCircle size={16} />
+                {errorMsg}
+            </div>
+            <button onClick={() => setErrorMsg(null)} className="text-red-400 hover:text-red-700">
+                <X size={16} />
+            </button>
+        </div>
+      )}
 
-             <div className="absolute bottom-8 left-0 right-0 flex flex-col items-center gap-4 z-10 pointer-events-none">
-                 <div className="pointer-events-auto">
-                    {(status === AppStatus.IDLE || status === AppStatus.ERROR || (status === AppStatus.PROCESSING && summary)) && !hasPostProcessed && !isSessionFinished ? (
-                        <button
-                            onClick={startRecording}
-                            className="flex items-center gap-2 px-8 py-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-full shadow-xl shadow-indigo-500/30 font-bold transition-all transform hover:scale-105 active:scale-95 border-4 border-white"
-                        >
-                            <PlayCircle size={24} /> 面談を開始
-                        </button>
-                    ) : (
-                        status === AppStatus.RECORDING ? (
-                            <button
-                                onClick={stopRecording}
-                                className="flex items-center gap-2 px-8 py-4 bg-red-500 hover:bg-red-600 text-white rounded-full shadow-xl shadow-red-500/30 font-bold transition-all transform hover:scale-105 active:scale-95 border-4 border-white"
-                            >
-                                <StopCircle size={24} /> 面談を終了
-                            </button>
-                        ) : null
-                    )}
-                 </div>
-             </div>
+      {/* Main Content */}
+      <div className="flex-1 flex overflow-hidden relative">
+        
+        {/* Left Panel: Transcript / Recording */}
+        <div className={`flex-1 flex flex-col h-full relative transition-all duration-300 ${isMobileMenuOpen ? 'hidden md:flex' : 'flex'}`}>
+            <TranscriptView 
+                key={`${sessionId}-transcript`}
+                transcripts={transcripts} 
+                onEdit={(id, text) => updateTranscript(id, text, true)}
+                isRecording={status === AppStatus.RECORDING}
+            />
+            
+            {/* Floating Controls */}
+            <div className="absolute bottom-8 left-1/2 transform -translate-x-1/2 flex items-center gap-4 z-20">
+                {!isSessionFinished && status === AppStatus.IDLE && !hasPostProcessed && (
+                    <button
+                        onClick={startRecording}
+                        className="flex items-center gap-3 bg-indigo-600 hover:bg-indigo-700 text-white px-8 py-4 rounded-full shadow-xl shadow-indigo-500/30 transition-all hover:scale-105 font-bold text-lg"
+                    >
+                        <PlayCircle size={24} /> 面談を開始
+                    </button>
+                )}
+
+                {status === AppStatus.RECORDING && (
+                    <button
+                        onClick={() => stopRecording()}
+                        className="flex items-center gap-3 bg-red-500 hover:bg-red-600 text-white px-8 py-4 rounded-full shadow-xl shadow-red-500/30 transition-all hover:scale-105 font-bold text-lg animate-pulse"
+                    >
+                        <StopCircle size={24} /> 面談を終了
+                    </button>
+                )}
+            </div>
+
+            {/* Analysis Overlay */}
+            {status === AppStatus.PROCESSING && (
+                <div className="absolute inset-0 bg-white/80 backdrop-blur-sm z-30 flex flex-col items-center justify-center">
+                    <Loader2 size={48} className="text-indigo-600 animate-spin mb-4" />
+                    <h3 className="text-xl font-bold text-slate-800">AIが分析中...</h3>
+                    <p className="text-slate-500 mt-2">話者の分離と文章の整型を行っています</p>
+                </div>
+            )}
         </div>
 
-        <div className="hidden md:block w-[400px] h-full z-10">
+        {/* Right Panel: Summary & Tools */}
+        <div className={`
+            fixed md:relative inset-y-0 right-0 w-full md:w-96 bg-white z-40 transform transition-transform duration-300 shadow-2xl md:shadow-none
+            ${isMobileMenuOpen ? 'translate-x-0' : 'translate-x-full md:translate-x-0'}
+        `}>
             <SummaryPanel 
-                key={sessionId} // Force remount on reset
+                key={`${sessionId}-summary`}
                 status={status}
                 summary={summary}
                 onGenerate={generateSummary}
@@ -622,32 +627,8 @@ const App: React.FC = () => {
                 onRemoveDocument={removeDocument}
             />
         </div>
-
-        {isMobileMenuOpen && (
-            <div className="fixed inset-0 z-50 md:hidden flex justify-end">
-                <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={() => setIsMobileMenuOpen(false)} />
-                <div className="w-[85%] max-w-sm h-full relative z-10 bg-white shadow-2xl animate-slide-in-right">
-                    <div className="absolute top-4 left-4 font-bold text-slate-700 flex items-center gap-2">
-                       <Mic size={18} className="text-indigo-600"/> メニュー
-                    </div>
-                    <button onClick={() => setIsMobileMenuOpen(false)} className="absolute top-4 right-4 p-2 text-slate-400">
-                        <X />
-                    </button>
-                    <div className="mt-12 h-full">
-                        <SummaryPanel 
-                            key={sessionId}
-                            status={status}
-                            summary={summary}
-                            onGenerate={generateSummary}
-                            onFileUpload={handleFileUpload}
-                            documents={documents}
-                            onRemoveDocument={removeDocument}
-                        />
-                    </div>
-                </div>
-            </div>
-        )}
-      </main>
+      </div>
+      
     </div>
   );
 };

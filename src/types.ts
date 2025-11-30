@@ -2,7 +2,7 @@ export type SpeakerRole = 'Staff' | 'Client' | 'AI';
 
 export interface TranscriptItem {
   id: string;
-  speaker: SpeakerRole; // Changed from string to SpeakerRole for better type safety
+  speaker: SpeakerRole;
   text: string;
   timestamp: Date;
   isFinal: boolean;
@@ -19,7 +19,7 @@ export interface RagDocument {
   id: string;
   name: string;
   content: string;
-  type: 'text/plain' | 'application/json'; // Simplified for this demo
+  type: 'text/plain' | 'application/json' | 'application/pdf' | 'image/jpeg' | 'image/png' | 'image/webp';
 }
 
 export enum AppStatus {
